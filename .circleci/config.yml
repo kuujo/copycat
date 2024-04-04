@@ -1,0 +1,110 @@
+version: 2.1
+
+orbs:
+  aws-ecr: circleci/aws-ecr@7.0.0
+  product-core: inmarsat/product-core-orb@0.5.0
+
+executors:
+  inmarsat-executor:
+    docker:
+      - image: 728074501999.dkr.ecr.eu-west-1.amazonaws.com/inmarsat/product-test-container:1.0
+  go-executor:
+    docker:
+      - image: 728074501999.dkr.ecr.eu-west-1.amazonaws.com/inmarsat/circleci-go-1.21-build-container:1.0
+
+jobs:
+  prepare:
+    executor: go-executor
+
+    steps:
+      - checkout
+
+      - save_cache:
+          paths:
+            - ~/project
+          key: v1-repo-{{ .Environment.CIRCLE_SHA1 }}
+
+
+
+  docker_build:
+    executor: go-executor
+
+    steps:
+      - checkout 
+      - restore_cache: # Restores the project folder
+          key: v1-repo-{{ .Environment.CIRCLE_SHA1 }}
+
+      - setup_remote_docker:
+          docker_layer_caching: true
+
+      - add_ssh_keys
+
+      - aws-ecr/ecr-login:
+          account-url: AWS_ECR_ACCOUNT_URL
+          aws-access-key-id: AWS_ACCESS_KEY_ID
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY
+          region: AWS_REGION
+
+      - run:
+          name: Build service
+          command: |
+            git config --global user.email "noreply@circleci.com"
+            git config --global user.name "CircleCI"
+            
+            IMAGE_NAME=`invoke get-ecr-name`
+            VERSION=`invoke get-version`
+            
+            if [ $CIRCLE_BRANCH = 'master' ]
+            then
+             invoke create-tag
+             VERSION=`invoke get-version`
+             IMAGE_TAG=`echo $VERSION`
+            else
+             IMAGE_TAG=`echo ${VERSION}`
+            fi
+            
+            # Export variables to be used by next steps/orbs
+            echo "export IMAGE_TAG=$IMAGE_TAG" >> $BASH_ENV
+            echo "export IMAGE_NAME=$IMAGE_NAME" >> $BASH_ENV
+            
+            invoke docker-build --ssh-key-path=~/.ssh/id_rsa_27f83d073ff1bc3898281ea3c0f479c9
+            docker tag ${IMAGE_NAME}:${VERSION} $AWS_ECR_ACCOUNT_URL/${IMAGE_NAME}:${IMAGE_TAG}
+      - aws-ecr/push-image:
+          account-url: AWS_ECR_ACCOUNT_URL
+          repo: $IMAGE_NAME
+          tag: $IMAGE_TAG
+
+  publish_provisioning:
+    executor: inmarsat-executor
+
+    steps:
+      - checkout
+      - add_ssh_keys
+
+      - run:
+          name: Publish to provisioning repo
+          command: |
+            git config --global user.email "noreply@circleci.com"
+            git config --global user.name "CircleCI"
+            invoke publish-to-ci-glue
+            invoke publish-to-jira
+            invoke publish-to-repo
+workflows:
+  version: 2
+  build_and_publish:
+    jobs:
+      - prepare:
+          context: product_build_environment
+
+      - docker_build:
+          requires:
+            - prepare
+          context: product_build_environment
+
+      - publish_provisioning:
+          filters:
+            branches:
+              only: master
+          requires:
+            - docker_build
+          context: product_build_environment
